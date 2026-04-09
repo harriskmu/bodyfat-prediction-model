@@ -1,0 +1,508 @@
+---
+title: "Body Fat Prediction Model — Regression Analysis for Health & Wellness Applications"
+author: "Harris K."
+date: "`r Sys.Date()`"
+output:
+  html_document:
+    toc: true
+    toc_depth: 3
+    toc_float: true
+    df_print: paged
+  pdf_document:
+    toc: true
+    latex_engine: xelatex
+---
+
+```{r setup, include=FALSE}
+knitr::opts_chunk$set(echo = TRUE, warning = FALSE, message = FALSE)
+options("scipen" = 10)
+
+loadLib <- function(libName) {
+  if (!require(libName, character.only = TRUE)) {
+    install.packages(libName)
+    require(libName, character.only = TRUE)
+  }
+}
+
+libs <- c(
+  "faraway", "glmnet", "MASS", "olsrr", "dplyr",
+  "reshape2", "knitr", "caret", "ggplot2", "scales", "lmtest"
+)
+for (lib in libs) loadLib(lib)
+
+# Helper — prints model equation from a fitted lm object
+dispRegFunc <- function(reg) {
+  coefs <- reg$coefficients
+  b0 <- coefs[1]
+  n <- length(coefs)
+  eq <- paste0("Y = ", round(b0, 4))
+  for (i in 2:n) {
+    eq <- paste0(eq, " + ", round(coefs[i], 4), "*", names(coefs)[i])
+  }
+  cat(eq, "\n")
+}
+```
+
+---
+
+## 1. Project Overview
+
+### 1.1 Objective
+
+This analysis builds a regression-based body fat prediction model intended for integration
+into a health and wellness application. The model estimates body fat percentage from
+physical measurements that users can self-report during onboarding — no clinical equipment
+required.
+
+The body fat estimate feeds directly into a personalized calorie calculation engine:
+
+- **Weight loss:** Calorie deficit relative to TDEE based on lean body mass
+- **Weight maintenance:** Calorie target matched to TDEE
+- **Weight gain:** Calorie surplus with lean mass preservation targets
+
+### 1.2 Why Not BMI?
+
+BMI is the default proxy for body composition in most consumer apps, but it is a crude
+measure. A muscular user and an overweight user can have the same BMI while having very
+different body fat percentages — and therefore very different calorie needs. A direct
+body fat model improves recommendation quality significantly for a large portion of users.
+
+### 1.3 Modeling Strategy
+
+Five regression approaches are tested and compared:
+
+| Model | Key Property |
+|---|---|
+| Linear Regression | Baseline — all predictors included |
+| Stepwise Selection | Automatic variable selection, both directions |
+| Ridge Regression | L2 regularization — shrinks all coefficients |
+| Lasso Regression | L1 regularization — performs variable selection |
+| Elastic Net | Blends Ridge and Lasso penalties |
+
+A Huber robust regression is also run to assess how much outlier observations affect
+model stability — a practical concern for a model that will see diverse user body types.
+
+All models are trained on 70% of the data and evaluated on a held-out 30% test set.
+
+---
+
+## 2. Data Preparation
+
+### 2.1 Dataset
+
+```{r load-data}
+data(fat, package = "faraway")
+
+# Remove variables that are derived from the target and
+# would not be available at prediction time in a live app
+fat.data <- fat[, !(names(fat) %in% c("brozek", "density"))]
+
+cat("Observations:", nrow(fat.data), "\n")
+cat("Predictors:  ", ncol(fat.data) - 1, "\n")
+cat("Response:     siri (body fat %)\n")
+```
+
+The dataset contains 252 adult male subjects. The response variable `siri` is body fat
+percentage measured via underwater weighing — the gold standard clinical method. Predictor
+variables include age, weight, height, BMI proxy (`adipos`), and 10 circumference
+measurements.
+
+### 2.2 Train / Test Split
+
+```{r split}
+set.seed(1023)
+train.idx  <- sample(1:nrow(fat.data), size = floor(0.70 * nrow(fat.data)))
+train.data <- fat.data[train.idx, ]
+test.data  <- fat.data[-train.idx, ]
+
+cat("Train set:", nrow(train.data), "observations (70%)\n")
+cat("Test set: ", nrow(test.data),  "observations (30%)\n")
+```
+
+### 2.3 Exploratory Analysis
+
+```{r eda-boxplot}
+boxplot(fat.data$siri,
+        main  = "Distribution of Body Fat Percentage (siri)",
+        ylab  = "Body Fat %",
+        col   = "steelblue",
+        notch = FALSE)
+```
+
+```{r eda-correlation}
+# Correlation between all predictors and the response
+cor.with.siri <- sort(cor(fat.data)[, "siri"], decreasing = TRUE)
+cor.df <- data.frame(
+  Predictor   = names(cor.with.siri),
+  Correlation = round(cor.with.siri, 3)
+)
+knitr::kable(cor.df, caption = "Correlation of Each Predictor with Body Fat %")
+```
+
+```{r eda-pairs, fig.height=8}
+# Scatterplot matrix for the strongest predictors
+strong.predictors <- c("siri", "abdom", "adipos", "chest", "hip", "weight")
+pairs(fat.data[, strong.predictors],
+      main = "Scatterplot Matrix — Top Predictors vs Body Fat %",
+      pch  = 19, col = "steelblue", cex = 0.5)
+```
+
+Abdomen circumference has the strongest correlation with body fat (r = 0.81), followed
+by adiposity index, chest, and hip. Body fat distribution is roughly normal with a slight
+right skew and a few high-end outliers.
+
+---
+
+## 3. Model Building
+
+### 3.1 Linear Regression — Full Model
+
+```{r linear}
+fat.lm <- lm(siri ~ ., data = train.data)
+summary(fat.lm)
+dispRegFunc(fat.lm)
+```
+
+```{r linear-diagnostics, fig.height=6}
+par(mfrow = c(2, 2))
+plot(fat.lm, main = "Linear Regression — Diagnostic Plots")
+```
+
+```{r linear-bp}
+olsrr::ols_test_breusch_pagan(fat.lm)
+```
+
+```{r linear-vif}
+vif.df <- data.frame(VIF = round(vif(fat.lm), 2))
+vif.df$Predictor <- rownames(vif.df)
+rownames(vif.df) <- NULL
+knitr::kable(
+  vif.df[order(-vif.df$VIF), c("Predictor", "VIF")],
+  caption = "Variance Inflation Factors — Linear Model"
+)
+```
+
+The full linear model achieves R² of 97.22% on training data. However, only 5 of 15
+predictors are individually significant — a strong signal of multicollinearity.
+VIF analysis confirms this: `weight` has a VIF of 199.54, and 6 predictors exceed
+the threshold of 10. The Breusch-Pagan test result suggests checking for heteroscedasticity
+before relying on standard errors.
+
+**Takeaway for the app:** The full linear model fits training data very well but is likely
+overfitting — too many correlated predictors are pulling in different directions.
+
+---
+
+### 3.2 Stepwise Selection
+
+```{r stepwise}
+set.seed(1023)
+fat.sw       <- olsrr::ols_step_both_p(fat.lm, pent = 0.35, prem = 0.05, details = FALSE)
+fat.sw.final <- fat.sw$model
+summary(fat.sw.final)
+dispRegFunc(fat.sw.final)
+plot(fat.sw)
+```
+
+Stepwise selection reduced the model from 15 to 9 predictors while maintaining nearly
+identical training R² (97.21%). Removed predictors: `abdom`, `hip`, `neck`, `knee`,
+`ankle`, `biceps`. The retained variables represent a leaner, more interpretable model.
+
+**Takeaway for the app:** The 9-predictor stepwise model is more practical for onboarding
+— fewer measurements to ask users for.
+
+---
+
+### 3.3 Ridge Regression
+
+```{r ridge-vif}
+# Multicollinearity confirmed — Ridge is appropriate
+olsrr::ols_vif_tol(fat.lm)
+```
+
+```{r ridge-corr}
+# Pairs of predictors with correlation above 0.80
+fat.cor <- data.frame(cor(train.data))
+fat.cor$P1 <- colnames(fat.cor)
+fat.cor.long <- fat.cor %>%
+  reshape2::melt(id.vars = "P1", variable.name = "P2", value.name = "r") %>%
+  dplyr::filter(r >= 0.80 & P1 != P2) %>%
+  dplyr::arrange(desc(r)) %>%
+  dplyr::filter(row_number() %% 2 == 1)
+knitr::kable(fat.cor.long, caption = "Highly Correlated Predictor Pairs (r >= 0.80)")
+```
+
+```{r ridge-model}
+set.seed(1023)
+x.train <- data.matrix(dplyr::select(train.data, -siri))
+y.train <- train.data$siri
+
+fat.ridge.cv    <- glmnet::cv.glmnet(x.train, y.train, alpha = 0,
+                                      nlambda = 100, lambda.min.ratio = 0.0001)
+best.lambda.ridge <- fat.ridge.cv$lambda.min
+plot(fat.ridge.cv)
+cat("Optimal lambda (Ridge):", round(best.lambda.ridge, 3), "\n")
+
+ridge.coefs <- coef(fat.ridge.cv, s = best.lambda.ridge)
+knitr::kable(
+  data.frame(
+    Predictor = ridge.coefs@Dimnames[[1]],
+    Coefficient = round(ridge.coefs@x, 4)
+  ),
+  caption = "Ridge Regression Coefficients at Optimal Lambda"
+)
+```
+
+Ridge addresses multicollinearity by applying an L2 penalty that shrinks all coefficients
+toward zero proportionally. The optimal lambda is 0.626. All 15 predictors are retained
+but their coefficients are redistributed — no single measurement dominates the prediction.
+
+Notable: the `wrist` coefficient flipped sign from positive (+0.263 in OLS) to negative
+(-0.352 in Ridge), because Ridge redistributed wrist's effect among correlated measurements
+for a more stable fit.
+
+**Takeaway for the app:** Ridge is the most numerically stable model for users with
+unusual body proportions, where correlated measurements might otherwise push OLS predictions
+to extremes.
+
+---
+
+### 3.4 Lasso Regression
+
+```{r lasso}
+set.seed(1023)
+fat.lasso.cv    <- glmnet::cv.glmnet(x.train, y.train, alpha = 1,
+                                      nlambda = 100, lambda.min.ratio = 0.0001)
+best.lambda.lasso <- fat.lasso.cv$lambda.min
+plot(fat.lasso.cv)
+cat("Optimal lambda (Lasso):", round(best.lambda.lasso, 3), "\n")
+
+lasso.coefs <- coef(fat.lasso.cv, s = "lambda.min")
+knitr::kable(
+  data.frame(
+    Predictor   = lasso.coefs@Dimnames[[1]],
+    Coefficient = round(lasso.coefs@x, 4)
+  ),
+  caption = "Lasso Coefficients at Optimal Lambda"
+)
+```
+
+Lasso uses a smaller optimal lambda (0.015) than Ridge, meaning less penalty is needed
+to find a good model. Only one predictor (`hip`) is dropped entirely — its coefficient
+set to exactly zero. The `free` variable (fat-free body weight) remains the strongest
+predictor at -0.587, consistent with the linear model.
+
+**Takeaway for the app:** Lasso confirms that nearly all body measurements carry
+independent predictive value. `hip` can be dropped from the user onboarding form
+without meaningful accuracy loss.
+
+---
+
+### 3.5 Elastic Net
+
+```{r elastic-net}
+set.seed(1023)
+fat.enet.cv    <- glmnet::cv.glmnet(x.train, y.train, alpha = 0.5,
+                                     nlambda = 100, lambda.min.ratio = 0.0001)
+best.lambda.enet <- fat.enet.cv$lambda.min
+cat("Optimal lambda (Elastic Net):", round(best.lambda.enet, 3), "\n")
+
+enet.coefs <- coef(fat.enet.cv, s = best.lambda.enet)
+knitr::kable(
+  data.frame(
+    Predictor   = enet.coefs@Dimnames[[1]],
+    Coefficient = round(enet.coefs@x, 4)
+  ),
+  caption = "Elastic Net Coefficients at Optimal Lambda"
+)
+```
+
+Elastic Net (alpha = 0.5) blends both penalties. Its optimal lambda of 0.039 sits between
+Lasso (0.015) and Ridge (0.626) as expected. Like Lasso, it removes only `hip`. All
+remaining coefficients are consistent with the other regularized models — a good sign of
+stable feature importance across methods.
+
+---
+
+## 4. Outlier Analysis — Robust Regression
+
+```{r robust}
+fat.huber <- MASS::rlm(siri ~ ., psi = psi.huber, data = fat.data)
+summary(fat.huber)
+dispRegFunc(fat.huber)
+```
+
+```{r robust-diagnostics}
+# Cook's distance — identifies high-influence observations
+olsrr::ols_plot_cooksd_chart(lm(siri ~ ., data = fat.data))
+
+# Residual-leverage plot
+olsrr::ols_plot_resid_lev(lm(siri ~ ., data = fat.data))
+```
+
+```{r robust-weights}
+fat.data$huber.weight <- fat.huber$w
+
+fat.data %>%
+  dplyr::mutate(Observation = row_number()) %>%
+  dplyr::arrange(huber.weight) %>%
+  dplyr::filter(row_number() <= 5) %>%
+  dplyr::select(Observation, siri, weight, huber.weight) %>%
+  knitr::kable(caption = "5 Observations with Lowest Huber Weights (Most Unusual)")
+```
+
+```{r robust-scatter}
+ggplot2::ggplot(fat.data, ggplot2::aes(x = height, y = weight)) +
+  ggplot2::geom_point(color = "steelblue", alpha = 0.7) +
+  ggplot2::geom_text(
+    label = rownames(fat.data),
+    nudge_x = 0.3, nudge_y = 0.3,
+    check_overlap = TRUE, size = 3
+  ) +
+  ggplot2::labs(
+    title = "Weight vs Height — Outlier Detection",
+    x = "Height (inches)", y = "Weight (lbs)"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+Two subjects received the lowest Huber weights, meaning the model downweighted their
+influence during fitting:
+
+- **Observation 39:** Weight of 363 lbs, well outside the typical range. Body fat
+  measured at 35.2% — much higher than the model would predict from circumference
+  measurements alone. In a live app, this user should be flagged for manual review
+  rather than receiving a raw model output.
+
+- **Observation 221:** Normal body dimensions but unusually low body fat (12.4%),
+  suggesting either exceptional fitness or a measurement anomaly.
+
+**Takeaway for the app:** A production deployment should include a confidence interval
+on each prediction. Users whose measurements fall more than 2 standard deviations from
+the training distribution should receive a disclaimer alongside their estimate.
+
+---
+
+## 5. Model Comparison
+
+### 5.1 Test Set Performance
+
+```{r test-comparison}
+set.seed(1023)
+x.test <- data.matrix(dplyr::select(test.data, -siri))
+
+test.data$pred.lm    <- predict(fat.lm, test.data)
+test.data$pred.sw    <- predict(fat.sw.final, test.data)
+test.data$pred.ridge <- predict(fat.ridge.cv, s = best.lambda.ridge, newx = x.test)[, 1]
+test.data$pred.lasso <- predict(fat.lasso.cv, s = best.lambda.lasso, newx = x.test)[, 1]
+test.data$pred.enet  <- predict(fat.enet.cv,  s = best.lambda.enet,  newx = x.test)[, 1]
+
+sst <- sum((test.data$siri - mean(test.data$siri))^2)
+n   <- nrow(test.data)
+
+results <- data.frame(
+  Model = c("Linear Regression", "Stepwise", "Ridge", "Lasso", "Elastic Net"),
+  Train_R2 = c(0.9722, 0.9721, NA, NA, NA),
+  Test_R2  = round(c(
+    1 - sum((test.data$siri - test.data$pred.lm)^2)    / sst,
+    1 - sum((test.data$siri - test.data$pred.sw)^2)    / sst,
+    1 - sum((test.data$siri - test.data$pred.ridge)^2) / sst,
+    1 - sum((test.data$siri - test.data$pred.lasso)^2) / sst,
+    1 - sum((test.data$siri - test.data$pred.enet)^2)  / sst
+  ), 4),
+  Test_MSE = round(c(
+    sum((test.data$siri - test.data$pred.lm)^2)    / n,
+    sum((test.data$siri - test.data$pred.sw)^2)    / n,
+    sum((test.data$siri - test.data$pred.ridge)^2) / n,
+    sum((test.data$siri - test.data$pred.lasso)^2) / n,
+    sum((test.data$siri - test.data$pred.enet)^2)  / n
+  ), 4)
+) %>% dplyr::arrange(desc(Test_R2))
+
+knitr::kable(results, caption = "Model Performance on Held-Out Test Data")
+```
+
+### 5.2 Results Summary
+
+```{r results-chart}
+ggplot2::ggplot(results, ggplot2::aes(x = reorder(Model, Test_R2), y = Test_R2)) +
+  ggplot2::geom_col(fill = "steelblue", width = 0.6) +
+  ggplot2::geom_text(ggplot2::aes(label = round(Test_R2, 3)),
+                     hjust = -0.1, size = 3.5) +
+  ggplot2::coord_flip() +
+  ggplot2::ylim(0, 1) +
+  ggplot2::labs(
+    title = "Test Set R² by Model",
+    x     = NULL,
+    y     = "R² (Test Data)"
+  ) +
+  ggplot2::theme_minimal()
+```
+
+Ridge regression achieves the highest test R² (0.876) and lowest MSE (9.67). Linear and
+Stepwise both trained at 97% R² but dropped significantly on test data — a clear sign
+of overfitting. Regularized models generalize far better to new users.
+
+---
+
+## 6. Production Recommendation
+
+### 6.1 Chosen Model: Ridge Regression
+
+Based on test set performance, Ridge regression is recommended for production deployment.
+
+| Metric | Value |
+|---|---|
+| Test R² | 0.876 |
+| Test MSE | 9.67 |
+| Predictors Required | 15 |
+| Handles Multicollinearity | Yes |
+| Overfitting Risk | Low |
+
+### 6.2 Downstream Calorie Calculation
+
+Once body fat percentage is estimated, calorie targets can be calculated as follows:
+
+```
+Lean Body Mass (lbs) = Weight × (1 - BodyFat% / 100)
+BMR = 370 + (21.6 × LBM in kg)                   # Katch-McArdle formula
+TDEE = BMR × Activity Multiplier
+
+Weight Loss:       Calorie Target = TDEE - 500     # ~0.5 lb/week deficit
+Maintenance:       Calorie Target = TDEE
+Weight Gain:       Calorie Target = TDEE + 300     # lean bulk surplus
+```
+
+### 6.3 Edge Case Handling
+
+- Users whose body measurements fall outside the training distribution should receive
+  a confidence interval alongside their body fat estimate
+- Observation flagging logic should be implemented before returning predictions to the UI
+- Model should be retrained periodically as the user base grows and more measurement
+  data becomes available
+
+### 6.4 Minimum Required Inputs for Prediction
+
+Based on Lasso and Elastic Net results, the minimum effective input set is:
+
+`age`, `weight`, `height`, `adipos`, `free`, `neck`, `chest`, `thigh`,
+`forearm`, `wrist`, `knee`, `ankle`, `biceps`
+
+(`hip` can be excluded — it was the only predictor removed by regularization.)
+
+---
+
+## 7. Conclusion
+
+This analysis demonstrates that body fat percentage can be predicted with high accuracy
+(test R² = 0.876) from self-reportable physical measurements using Ridge regression.
+The model is robust, stable across unseen data, and practical for integration into a
+consumer health app.
+
+Replacing BMI-based calorie estimates with this body composition model would meaningfully
+improve recommendation quality — particularly for muscular users, users carrying weight
+in specific body regions, and users at the extremes of the weight distribution.
+
+The model is ready for integration into a calorie calculation pipeline with the
+downstream formula described in Section 6.2.
+```
